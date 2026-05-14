@@ -427,3 +427,32 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# --- noetl-doctor (Python) additions ---
+
+# Virtualenvs
+.venv/
+venv/
+env/
+.python-version
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# --- noetl-doctor (Rust) ---
+# Cargo.lock is committed (this is a binary crate).
+/target/
+**/*.rs.bk

@@ -1,0 +1,148 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: doctor_reachability_smoke
+  path: doctor/reachability_smoke
+  description: |
+    Validate that the NoETL server is reachable over HTTP and that the
+    Postgres NoETL database is reachable. Designed for use as a
+    Kubernetes liveness/readiness probe runner or as the first step in
+    a monitoring-triggered reaper job.
+
+      noetl run playbooks/reachability_smoke.yaml --runtime local \
+        --set action=probe \
+        --set noetl_server_url=http://localhost:8082 \
+        --set pg_dsn=postgresql://noetl@localhost:5432/noetl
+
+    Lifecycle verbs: probe (default), help.
+
+  exposes_as_mcp: true
+  tags:
+    - doctor
+    - runtime-reaper
+    - reachability
+  capabilities:
+    - reachability-probe
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: probe                 # probe, help
+  noetl_server_url: "http://localhost:8082"
+  pg_dsn: "postgresql://noetl@localhost:5432/noetl"
+
+workflow:
+  - step: start
+    desc: Entry point for reachability smoke
+    tool:
+      kind: shell
+      cmds:
+        - echo "doctor.reachability_smoke - action '{{ workload.action }}'"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: probe_server_health
+          when: "{{ workload.action == 'probe' }}"
+        - step: show_help
+
+  - step: probe_server_health
+    desc: Hit /api/health on the NoETL server
+    tool:
+      - name: health
+        kind: http
+        method: GET
+        url: "{{ workload.noetl_server_url }}/api/health"
+        timeout_seconds: 10
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: probe_pg
+
+  - step: probe_pg
+    desc: Issue SELECT 1 against the NoETL Postgres database
+    tool:
+      - name: pg_ping
+        kind: postgres
+        dsn: "{{ workload.pg_dsn }}"
+        query: |
+          SELECT 1 AS ok
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: probe_runtime_pool
+
+  - step: probe_runtime_pool
+    desc: Count ready worker pool runtimes and stale rows
+    tool:
+      - name: pool
+        kind: postgres
+        dsn: "{{ workload.pg_dsn }}"
+        query: |
+          SELECT
+              COUNT(*) FILTER (WHERE status = 'ready')   AS ready_workers,
+              COUNT(*) FILTER (WHERE status != 'ready')  AS non_ready_workers,
+              COUNT(*) FILTER (
+                  WHERE heartbeat < (NOW() - INTERVAL '5 minutes')
+              )                                          AS stale_heartbeat_workers
+          FROM noetl.runtime
+          WHERE kind = 'worker_pool'
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: report
+
+  - step: report
+    desc: Combine results
+    tool:
+      - name: combine
+        kind: python
+        input:
+          server_health: "{{ probe_server_health }}"
+          pg_ping: "{{ probe_pg }}"
+          pool: "{{ probe_runtime_pool }}"
+        code: |
+          server = input_data.get("server_health") or {}
+          pool_rows = input_data.get("pool") or []
+          pool = pool_rows[0] if pool_rows else {}
+          ok = bool(server) and bool(input_data.get("pg_ping"))
+          return {
+              "ok": ok,
+              "noetl_server_health": server,
+              "worker_pool": pool,
+          }
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: show_help
+    desc: Print usage for callers who invoked without a known action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          echo "Usage:"
+          echo "  noetl run playbooks/reachability_smoke.yaml --runtime local --set action=<action>"
+          echo ""
+          echo "Actions: probe, help"
+          echo ""
+          echo "Defaults:"
+          echo "  noetl_server_url={{ workload.noetl_server_url }}"
+          echo "  pg_dsn={{ workload.pg_dsn }}"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Terminal step
+    tool:
+      kind: noop

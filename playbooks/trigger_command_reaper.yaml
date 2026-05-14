@@ -1,0 +1,119 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: doctor_trigger_command_reaper
+  path: doctor/trigger_command_reaper
+  description: |
+    Ask a running NoETL server to run a single command-reaper sweep
+    on demand. The endpoint is idempotent: the in-process reaper is
+    still the authority and runs on its own interval; this call is a
+    best-effort nudge driven from monitoring/MCP.
+
+      noetl run playbooks/trigger_command_reaper.yaml --runtime local \
+        --set action=trigger \
+        --set noetl_server_url=http://localhost:8082
+
+    Lifecycle verbs: trigger (default), help.
+
+  exposes_as_mcp: true
+  tags:
+    - doctor
+    - runtime-reaper
+    - repair
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: trigger            # trigger, help
+  noetl_server_url: "http://localhost:8082"
+
+workflow:
+  - step: start
+    desc: Entry point for the reaper-sweep nudge
+    tool:
+      kind: shell
+      cmds:
+        - echo "doctor.trigger_command_reaper - action '{{ workload.action }}'"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: nudge
+          when: "{{ workload.action == 'trigger' }}"
+        - step: show_help
+
+  - step: nudge
+    desc: POST /api/admin/command_reaper/sweep
+    tool:
+      - name: sweep
+        kind: http
+        method: POST
+        url: "{{ workload.noetl_server_url }}/api/admin/command_reaper/sweep"
+        timeout_seconds: 30
+        # Tolerate a 404 — older NoETL versions do not yet expose
+        # this admin endpoint, in which case the in-process reaper
+        # still owns scheduling and this playbook surfaces a soft
+        # note rather than failing.
+        allow_status: [200, 202, 404]
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: report
+
+  - step: report
+    desc: Surface the sweep outcome
+    tool:
+      - name: combine
+        kind: python
+        input:
+          response: "{{ nudge }}"
+        code: |
+          resp = input_data.get("response") or {}
+          status = (resp or {}).get("status_code")
+          if status == 404:
+              return {
+                  "status": "noop",
+                  "note": "admin sweep endpoint not implemented; in-process reaper still runs",
+              }
+          if status and status < 400:
+              return {
+                  "status": "ok",
+                  "body": resp.get("body"),
+              }
+          return {
+              "status": "error",
+              "status_code": status,
+              "body": resp.get("body"),
+          }
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: show_help
+    desc: Print usage for callers who invoked without a known action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          echo "Usage:"
+          echo "  noetl run playbooks/trigger_command_reaper.yaml --runtime local --set action=<action>"
+          echo ""
+          echo "Actions: trigger, help"
+          echo ""
+          echo "Defaults:"
+          echo "  noetl_server_url={{ workload.noetl_server_url }}"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Terminal step
+    tool:
+      kind: noop
