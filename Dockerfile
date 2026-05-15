@@ -2,7 +2,7 @@
 #
 # Builds the Rust `noetl-doctor` binary, then bundles the upstream
 # `noetl` Rust CLI release for `noetl run --runtime local`. The final
-# image is a small alpine runtime suitable for either:
+# image is an Ubuntu runtime suitable for either:
 #
 #   * a one-shot Kubernetes Job  → CMD: ["detect"]
 #   * a long-running MCP server  → CMD: ["mcp", "serve"]
@@ -12,7 +12,7 @@
 #
 # Build args:
 #   NOETL_CLI_VERSION   (default 2.14.1) — release tag of `noetl/cli`
-#   NOETL_CLI_ARCH      (default x86_64-unknown-linux-musl)
+#   TARGETARCH          (provided by Docker/Podman buildx: amd64 / arm64)
 
 # ---- chef stage (cargo-chef dependency cache) -------------------------------
 FROM lukemathwalker/cargo-chef:0.1.73-rust-1.91.1-alpine3.22 AS chef
@@ -30,25 +30,35 @@ COPY . .
 RUN cargo build --release --bin noetl-doctor
 
 # ---- noetl CLI fetch (uses release asset) -----------------------------------
-FROM alpine:3.22.2 AS noetl-cli
+FROM ubuntu:24.04 AS noetl-cli
 ARG NOETL_CLI_VERSION=2.14.1
-ARG NOETL_CLI_ARCH=x86_64-unknown-linux-musl
+ARG TARGETARCH
 WORKDIR /tmp
-RUN apk add --no-cache ca-certificates curl tar \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl tar \
+ && rm -rf /var/lib/apt/lists/* \
+ && case "${TARGETARCH}" in \
+      amd64) NOETL_CLI_ARCH=x86_64 ;; \
+      arm64) NOETL_CLI_ARCH=aarch64 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
  && curl -fsSL -o /tmp/noetl.tar.gz \
-        "https://github.com/noetl/cli/releases/download/v${NOETL_CLI_VERSION}/noetl-v${NOETL_CLI_VERSION}-${NOETL_CLI_ARCH}.tar.gz" \
+        "https://github.com/noetl/cli/releases/download/v${NOETL_CLI_VERSION}/noetl-v${NOETL_CLI_VERSION}-linux-${NOETL_CLI_ARCH}.tar.gz" \
  && tar -xzf /tmp/noetl.tar.gz -C /tmp/ \
  && install -m 0755 /tmp/noetl /usr/local/bin/noetl \
  && /usr/local/bin/noetl --version
 
 # ---- runtime ---------------------------------------------------------------
-FROM alpine:3.22.2 AS runtime
+FROM ubuntu:24.04 AS runtime
 WORKDIR /app
 # Healing playbooks run under `noetl run --runtime local`, which only
 # supports `kind: shell` / http / playbook / duckdb / auth / sink / rhai
 # in the Rust CLI. Every doctor playbook is `kind: shell` driving
 # `psql` / `curl` / `jq`, so the runtime image bundles those.
-RUN apk add --no-cache ca-certificates libgcc bash curl jq postgresql-client
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates bash curl jq postgresql-client wget \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder    /app/target/release/noetl-doctor /usr/local/bin/noetl-doctor
 COPY --from=noetl-cli  /usr/local/bin/noetl              /usr/local/bin/noetl
