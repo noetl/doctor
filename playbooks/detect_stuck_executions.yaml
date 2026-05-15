@@ -130,7 +130,13 @@ workflow:
                   AND (
                         (c.status IN ('CLAIMED', 'RUNNING')
                             AND c.claimed_at IS NOT NULL
-                            AND c.claimed_at < (NOW() - make_interval(secs => ${STALE_SECONDS})))
+                            AND c.claimed_at < (NOW() - make_interval(secs => ${STALE_SECONDS}))
+                            AND (
+                                r.name IS NULL
+                                OR r.status NOT IN ('ready', 'running')
+                                OR r.heartbeat IS NULL
+                                OR r.heartbeat < (NOW() - make_interval(secs => ${STALE_SECONDS}))
+                            ))
                      OR (c.status = 'PENDING'
                             AND c.created_at < (NOW() - make_interval(secs => ${PENDING_RETRY_SECONDS})))
                   )
