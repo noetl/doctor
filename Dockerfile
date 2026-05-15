@@ -44,7 +44,11 @@ RUN apk add --no-cache ca-certificates curl tar \
 # ---- runtime ---------------------------------------------------------------
 FROM alpine:3.22.2 AS runtime
 WORKDIR /app
-RUN apk add --no-cache ca-certificates libgcc
+# Healing playbooks run under `noetl run --runtime local`, which only
+# supports `kind: shell` / http / playbook / duckdb / auth / sink / rhai
+# in the Rust CLI. Every doctor playbook is `kind: shell` driving
+# `psql` / `curl` / `jq`, so the runtime image bundles those.
+RUN apk add --no-cache ca-certificates libgcc bash curl jq postgresql-client
 
 COPY --from=builder    /app/target/release/noetl-doctor /usr/local/bin/noetl-doctor
 COPY --from=noetl-cli  /usr/local/bin/noetl              /usr/local/bin/noetl

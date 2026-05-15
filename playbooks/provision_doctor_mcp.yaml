@@ -289,4 +289,6 @@ workflow:
   - step: end
     desc: End workflow
     tool:
-      kind: noop
+      kind: shell
+      cmds:
+        - ":"

@@ -15,6 +15,9 @@ metadata:
 
     Lifecycle verbs: trigger (default), help.
 
+    Implemented entirely with `kind: shell` + `curl` so it parses
+    under the canonical `noetl run --runtime local` path.
+
   exposes_as_mcp: true
   tags:
     - doctor
@@ -35,7 +38,9 @@ workflow:
     tool:
       kind: shell
       cmds:
-        - echo "doctor.trigger_command_reaper - action '{{ workload.action }}'"
+        - |
+          set -euo pipefail
+          echo "doctor.trigger_command_reaper - action '{{ workload.action }}'" >&2
     next:
       spec:
         mode: exclusive
@@ -45,49 +50,42 @@ workflow:
         - step: show_help
 
   - step: nudge
-    desc: POST /api/admin/command_reaper/sweep
+    desc: POST /api/admin/command_reaper/sweep (404-tolerant)
     tool:
-      - name: sweep
-        kind: http
-        method: POST
-        url: "{{ workload.noetl_server_url }}/api/admin/command_reaper/sweep"
-        timeout_seconds: 30
-        # Tolerate a 404 — older NoETL versions do not yet expose
-        # this admin endpoint, in which case the in-process reaper
-        # still owns scheduling and this playbook surfaces a soft
-        # note rather than failing.
-        allow_status: [200, 202, 404]
-    next:
-      spec:
-        mode: exclusive
-      arcs:
-        - step: report
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          URL='{{ workload.noetl_server_url }}/api/admin/command_reaper/sweep'
 
-  - step: report
-    desc: Surface the sweep outcome
-    tool:
-      - name: combine
-        kind: python
-        input:
-          response: "{{ nudge }}"
-        code: |
-          resp = input_data.get("response") or {}
-          status = (resp or {}).get("status_code")
-          if status == 404:
-              return {
-                  "status": "noop",
-                  "note": "admin sweep endpoint not implemented; in-process reaper still runs",
-              }
-          if status and status < 400:
-              return {
-                  "status": "ok",
-                  "body": resp.get("body"),
-              }
-          return {
-              "status": "error",
-              "status_code": status,
-              "body": resp.get("body"),
-          }
+          # Capture both the response body and the trailing status code.
+          # `-w '\n%{http_code}'` keeps body+code separable. -m 30 caps
+          # the request at 30s; older NoETL versions do not expose the
+          # sweep endpoint, so we tolerate a 404 here as `noop`.
+          RAW=$(curl -sS -m 30 -X POST \
+                      -H 'content-type: application/json' \
+                      -d '{}' \
+                      -w '\n%{http_code}' \
+                      "${URL}" 2>/dev/null || echo $'\n000')
+
+          STATUS=$(printf '%s' "${RAW}" | tail -n1)
+          BODY=$(printf '%s' "${RAW}"   | sed '$d')
+
+          case "${STATUS}" in
+            200|202)
+              jq -n --arg body "${BODY}" --arg code "${STATUS}" \
+                '{status: "ok", status_code: ($code|tonumber), body: $body}'
+              ;;
+            404)
+              jq -n --arg code "${STATUS}" \
+                '{status: "noop", status_code: ($code|tonumber),
+                  note: "admin sweep endpoint not implemented; in-process reaper still runs"}'
+              ;;
+            *)
+              jq -n --arg body "${BODY}" --arg code "${STATUS}" \
+                '{status: "error", status_code: ($code|tonumber? // 0), body: $body}'
+              ;;
+          esac
     next:
       spec:
         mode: exclusive
@@ -116,4 +114,6 @@ workflow:
   - step: end
     desc: Terminal step
     tool:
-      kind: noop
+      kind: shell
+      cmds:
+        - ":"
