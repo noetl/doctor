@@ -1,0 +1,204 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: doctor_detect_stuck_executions
+  path: doctor/detect_stuck_executions
+  description: |
+    Detect stuck NoETL executions and stale noetl.command rows. Read-only.
+    Mirrors the in-process command reaper's staleness predicate so
+    monitoring sees the same surface the server would act on.
+
+    Designed to run under `noetl run --runtime local`:
+
+      noetl run playbooks/detect_stuck_executions.yaml --runtime local \
+        --set action=detect \
+        --set pg_dsn=postgresql://noetl@localhost:5432/noetl \
+        --set stale_seconds=300
+
+    Lifecycle verbs: detect (default), help.
+
+  exposes_as_mcp: true
+  tags:
+    - doctor
+    - runtime-reaper
+    - read-only
+  capabilities:
+    - stuck-execution-detection
+    - stale-command-detection
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: detect            # detect, help
+  pg_dsn: "postgresql://noetl@localhost:5432/noetl"
+  stale_seconds: 300
+  pending_retry_seconds: 60
+  max_rows: 200
+
+workflow:
+  - step: start
+    desc: Entry point for stuck-execution detection
+    tool:
+      kind: shell
+      cmds:
+        - echo "doctor.detect_stuck_executions - action '{{ workload.action }}'"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: probe_stuck_executions
+          when: "{{ workload.action == 'detect' }}"
+        - step: show_help
+
+  - step: probe_stuck_executions
+    desc: Find executions with no terminal event and no recent activity
+    tool:
+      - name: stuck_executions
+        kind: postgres
+        dsn: "{{ workload.pg_dsn }}"
+        query: |
+          WITH live_execs AS (
+              SELECT DISTINCT e.execution_id
+              FROM noetl.event e
+              WHERE e.event_type IN ('execution.started', 'execution.resumed')
+                AND NOT EXISTS (
+                    SELECT 1 FROM noetl.event et
+                    WHERE et.execution_id = e.execution_id
+                      AND et.event_type IN (
+                          'playbook.completed', 'playbook.failed',
+                          'workflow.completed', 'workflow.failed',
+                          'execution.cancelled'
+                      )
+                )
+          ),
+          last_event AS (
+              SELECT e.execution_id, MAX(e.created_at) AS last_at
+              FROM noetl.event e
+              JOIN live_execs le ON le.execution_id = e.execution_id
+              GROUP BY e.execution_id
+          )
+          SELECT
+              le.execution_id,
+              le.last_at AS last_event_at,
+              EXTRACT(EPOCH FROM (NOW() - le.last_at)) AS stuck_seconds,
+              (
+                  SELECT count(*) FROM noetl.command c
+                  WHERE c.execution_id = le.execution_id
+                    AND c.status IN ('PENDING', 'CLAIMED', 'RUNNING')
+              ) AS non_terminal_command_count
+          FROM last_event le
+          WHERE le.last_at < (NOW() - make_interval(secs => {{ workload.stale_seconds }}))
+          ORDER BY le.last_at ASC
+          LIMIT {{ workload.max_rows }}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: probe_stale_commands
+
+  - step: probe_stale_commands
+    desc: Surface stale PENDING/CLAIMED/RUNNING noetl.command rows
+    tool:
+      - name: stale_commands
+        kind: postgres
+        dsn: "{{ workload.pg_dsn }}"
+        query: |
+          SELECT
+              c.event_id,
+              c.execution_id,
+              c.command_id::text AS command_id,
+              c.step_name        AS step,
+              c.status,
+              c.worker_id,
+              EXTRACT(EPOCH FROM (NOW() - c.claimed_at)) AS claim_age_seconds,
+              EXTRACT(EPOCH FROM (NOW() - c.created_at)) AS pending_age_seconds,
+              r.status AS worker_status,
+              EXTRACT(EPOCH FROM (NOW() - r.heartbeat)) AS worker_heartbeat_age_seconds
+          FROM noetl.command c
+          LEFT JOIN noetl.runtime r
+              ON r.kind = 'worker_pool' AND r.name = c.worker_id
+          WHERE c.status IN ('PENDING', 'CLAIMED', 'RUNNING')
+            AND (
+                  (c.status IN ('CLAIMED', 'RUNNING')
+                      AND c.claimed_at IS NOT NULL
+                      AND c.claimed_at < (NOW() - make_interval(secs => {{ workload.stale_seconds }})))
+               OR (c.status = 'PENDING'
+                      AND c.created_at < (NOW() - make_interval(secs => {{ workload.pending_retry_seconds }})))
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM noetl.event et
+                WHERE et.execution_id = c.execution_id
+                  AND et.event_type IN (
+                      'playbook.completed', 'playbook.failed',
+                      'workflow.completed', 'workflow.failed',
+                      'execution.cancelled'
+                  )
+            )
+          ORDER BY c.execution_id, c.claimed_at NULLS LAST, c.created_at
+          LIMIT {{ workload.max_rows }}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: report
+
+  - step: report
+    desc: Summarize detection results for the caller
+    tool:
+      - name: summarize
+        kind: python
+        input:
+          stuck_executions: "{{ probe_stuck_executions }}"
+          stale_commands: "{{ probe_stale_commands }}"
+          stale_seconds: "{{ workload.stale_seconds }}"
+          pending_retry_seconds: "{{ workload.pending_retry_seconds }}"
+        code: |
+          stuck = input_data.get("stuck_executions") or []
+          stale = input_data.get("stale_commands") or []
+          status = "stuck" if (stuck or stale) else "ok"
+          return {
+              "status": status,
+              "thresholds": {
+                  "stale_seconds": input_data.get("stale_seconds"),
+                  "pending_retry_seconds": input_data.get("pending_retry_seconds"),
+              },
+              "stuck_executions": stuck,
+              "stale_commands": stale,
+              "summary": {
+                  "stuck_execution_count": len(stuck),
+                  "stale_command_count": len(stale),
+              },
+          }
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: show_help
+    desc: Print usage for callers who invoked without a known action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          echo "Usage:"
+          echo "  noetl run playbooks/detect_stuck_executions.yaml --runtime local --set action=<action>"
+          echo ""
+          echo "Actions: detect, help"
+          echo ""
+          echo "Defaults:"
+          echo "  pg_dsn={{ workload.pg_dsn }}"
+          echo "  stale_seconds={{ workload.stale_seconds }} pending_retry_seconds={{ workload.pending_retry_seconds }}"
+          echo "  max_rows={{ workload.max_rows }}"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Terminal step
+    tool:
+      kind: noop

@@ -1,0 +1,292 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: doctor_provision_mcp
+  path: doctor/provision_doctor_mcp
+  description: |
+    Provision (or tear down) the noetl-doctor MCP server in a NoETL
+    cluster. Mirrors the operational style used in `repos/ops` (see
+    `automation/development/mcp_kubernetes.yaml`):
+
+      noetl run playbooks/provision_doctor_mcp.yaml \
+        --runtime local --set action=deploy
+
+    Lifecycle verbs: deploy, redeploy, status, destroy, logs, help.
+    Defaults to `help` so a bare invocation is always safe.
+
+    The image must already be built and loaded (locally via
+    `make docker` or pushed to a registry via CI). This playbook only
+    performs the kubectl-driven provisioning.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: help               # deploy, redeploy, status, destroy, logs, help
+  expected_kube_context: "kind-noetl"
+
+  namespace: "noetl-doctor"
+  release_name: "noetl-doctor-mcp"
+
+  image: "noetl/doctor:dev"
+  image_pull_policy: "IfNotPresent"
+
+  service_type: "ClusterIP"
+  service_port: 8765
+
+  # NoETL server URL the doctor MCP should target. The pod sets it as
+  # an env var so each MCP tool invocation knows where to look.
+  noetl_url: "http://noetl-server.noetl.svc.cluster.local:80"
+
+  # Optional Postgres DSN; passed in via an opaque Secret so it never
+  # appears in `kubectl get deploy -o yaml`. Leave empty to skip — the
+  # detect playbook will fall back to the NoETL HTTP API.
+  pg_dsn: ""
+
+  stale_seconds: 300
+  pending_retry_seconds: 60
+
+workflow:
+  - step: run
+    desc: Provision the noetl-doctor MCP server
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+
+          ACTION="{{ workload.action }}"
+          EXPECTED_CONTEXT="{{ workload.expected_kube_context }}"
+          NAMESPACE="{{ workload.namespace }}"
+          RELEASE_NAME="{{ workload.release_name }}"
+          IMAGE="{{ workload.image }}"
+          IMAGE_PULL_POLICY="{{ workload.image_pull_policy }}"
+          SERVICE_TYPE="{{ workload.service_type }}"
+          SERVICE_PORT="{{ workload.service_port }}"
+          NOETL_URL="{{ workload.noetl_url }}"
+          PG_DSN="{{ workload.pg_dsn }}"
+          STALE_SECONDS="{{ workload.stale_seconds }}"
+          PENDING_RETRY_SECONDS="{{ workload.pending_retry_seconds }}"
+
+          ensure_kube_context() {
+            CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "none")
+            if [ "$CURRENT_CONTEXT" = "none" ]; then
+              echo "ERROR: No kubernetes context selected."
+              echo "Set context to $EXPECTED_CONTEXT before deploy/status actions."
+              exit 1
+            fi
+            if [ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]; then
+              echo "ERROR: Refusing to run against context '$CURRENT_CONTEXT'."
+              echo "Expected context: '$EXPECTED_CONTEXT'"
+              echo "Run: kubectl config use-context $EXPECTED_CONTEXT"
+              exit 1
+            fi
+          }
+
+          apply_namespace() {
+            kubectl get ns "$NAMESPACE" >/dev/null 2>&1 || \
+              kubectl create namespace "$NAMESPACE"
+          }
+
+          apply_secret() {
+            # noetl-doctor-config carries the Postgres DSN (optional).
+            # Recreating the Secret is the simplest way to update it
+            # idempotently; the Deployment picks up the new value on
+            # the next rollout.
+            if [ -n "$PG_DSN" ]; then
+              kubectl -n "$NAMESPACE" create secret generic "${RELEASE_NAME}-config" \
+                --from-literal=pg_dsn="$PG_DSN" \
+                --dry-run=client -o yaml | kubectl apply -f -
+            else
+              kubectl -n "$NAMESPACE" delete secret "${RELEASE_NAME}-config" --ignore-not-found
+            fi
+          }
+
+          apply_manifests() {
+            local pg_dsn_env_block=""
+            if [ -n "$PG_DSN" ]; then
+              pg_dsn_env_block="$(cat <<'EOF'
+                - name: NOETL_DOCTOR_PG_DSN
+                  valueFrom:
+                    secretKeyRef:
+                      name: RELEASE_NAME_PLACEHOLDER-config
+                      key: pg_dsn
+          EOF
+              )"
+              pg_dsn_env_block="${pg_dsn_env_block//RELEASE_NAME_PLACEHOLDER/$RELEASE_NAME}"
+            fi
+
+            cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: ${RELEASE_NAME}
+            namespace: ${NAMESPACE}
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${RELEASE_NAME}
+            namespace: ${NAMESPACE}
+            labels:
+              app.kubernetes.io/name: noetl-doctor
+              app.kubernetes.io/component: mcp
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: noetl-doctor
+                app.kubernetes.io/component: mcp
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/name: noetl-doctor
+                  app.kubernetes.io/component: mcp
+              spec:
+                serviceAccountName: ${RELEASE_NAME}
+                containers:
+                  - name: doctor
+                    image: ${IMAGE}
+                    imagePullPolicy: ${IMAGE_PULL_POLICY}
+                    args: ["mcp", "serve", "--host", "0.0.0.0", "--port", "${SERVICE_PORT}"]
+                    env:
+                      - name: NOETL_DOCTOR_NOETL_URL
+                        value: "${NOETL_URL}"
+                      - name: NOETL_DOCTOR_STALE_SECONDS
+                        value: "${STALE_SECONDS}"
+                      - name: NOETL_DOCTOR_PENDING_RETRY_SECONDS
+                        value: "${PENDING_RETRY_SECONDS}"
+          ${pg_dsn_env_block}
+                    ports:
+                      - name: http
+                        containerPort: ${SERVICE_PORT}
+                    readinessProbe:
+                      httpGet:
+                        path: /healthz
+                        port: http
+                      initialDelaySeconds: 3
+                      periodSeconds: 10
+                    livenessProbe:
+                      httpGet:
+                        path: /healthz
+                        port: http
+                      initialDelaySeconds: 10
+                      periodSeconds: 30
+                    resources:
+                      requests:
+                        cpu: 25m
+                        memory: 32Mi
+                      limits:
+                        cpu: 200m
+                        memory: 128Mi
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${RELEASE_NAME}
+            namespace: ${NAMESPACE}
+            labels:
+              app.kubernetes.io/name: noetl-doctor
+              app.kubernetes.io/component: mcp
+          spec:
+            type: ${SERVICE_TYPE}
+            selector:
+              app.kubernetes.io/name: noetl-doctor
+              app.kubernetes.io/component: mcp
+            ports:
+              - name: http
+                port: ${SERVICE_PORT}
+                targetPort: http
+          EOF
+          }
+
+          deploy() {
+            ensure_kube_context
+            apply_namespace
+            apply_secret
+            apply_manifests
+            kubectl -n "$NAMESPACE" rollout status "deployment/$RELEASE_NAME" --timeout=120s
+            status
+          }
+
+          redeploy() {
+            ensure_kube_context
+            apply_namespace
+            apply_secret
+            apply_manifests
+            kubectl -n "$NAMESPACE" rollout restart "deployment/$RELEASE_NAME"
+            kubectl -n "$NAMESPACE" rollout status  "deployment/$RELEASE_NAME" --timeout=120s
+            status
+          }
+
+          status() {
+            ensure_kube_context
+            if ! kubectl get ns "$NAMESPACE" >/dev/null 2>&1; then
+              echo "Namespace '$NAMESPACE' not found"
+              return 0
+            fi
+            kubectl -n "$NAMESPACE" get deploy,svc,pods -l app.kubernetes.io/name=noetl-doctor -o wide
+            echo ""
+            echo "Health probe:"
+            kubectl -n "$NAMESPACE" delete pod doctor-health-check --ignore-not-found >/dev/null 2>&1 || true
+            kubectl -n "$NAMESPACE" run doctor-health-check --rm -i --restart=Never \
+              --image=curlimages/curl:8.10.1 --quiet -- \
+              sh -c "curl -fsS 'http://${RELEASE_NAME}.${NAMESPACE}.svc.cluster.local:${SERVICE_PORT}/healthz' && echo" || true
+          }
+
+          logs() {
+            ensure_kube_context
+            kubectl -n "$NAMESPACE" logs deployment/"$RELEASE_NAME" --tail=200
+          }
+
+          destroy() {
+            ensure_kube_context
+            kubectl -n "$NAMESPACE" delete deploy,svc,sa -l app.kubernetes.io/name=noetl-doctor --ignore-not-found
+            kubectl -n "$NAMESPACE" delete secret "${RELEASE_NAME}-config" --ignore-not-found
+            kubectl delete namespace "$NAMESPACE" --ignore-not-found
+          }
+
+          case "$ACTION" in
+            deploy)
+              deploy
+              ;;
+            redeploy)
+              redeploy
+              ;;
+            status)
+              status
+              ;;
+            destroy)
+              destroy
+              ;;
+            logs)
+              logs
+              ;;
+            help|*)
+              echo "Usage:"
+              echo "  noetl run playbooks/provision_doctor_mcp.yaml --runtime local --set action=<action>"
+              echo ""
+              echo "Actions: deploy, redeploy, status, destroy, logs, help"
+              echo ""
+              echo "Defaults:"
+              echo "  image=$IMAGE pull=$IMAGE_PULL_POLICY"
+              echo "  namespace=$NAMESPACE release=$RELEASE_NAME"
+              echo "  service=$SERVICE_TYPE:$SERVICE_PORT"
+              echo "  noetl_url=$NOETL_URL"
+              echo "  stale_seconds=$STALE_SECONDS pending_retry_seconds=$PENDING_RETRY_SECONDS"
+              echo ""
+              echo "Examples:"
+              echo "  noetl run playbooks/provision_doctor_mcp.yaml --runtime local \\"
+              echo "    --set action=deploy --set image=ghcr.io/noetl/doctor:0.1.0"
+              echo "  noetl run playbooks/provision_doctor_mcp.yaml --runtime local \\"
+              echo "    --set action=deploy --set pg_dsn=postgresql://noetl@.../noetl"
+              ;;
+          esac
+    next:
+      - step: end
+
+  - step: end
+    desc: End workflow
+    tool:
+      kind: noop

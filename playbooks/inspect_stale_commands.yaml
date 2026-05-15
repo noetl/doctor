@@ -1,0 +1,152 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: doctor_inspect_stale_commands
+  path: doctor/inspect_stale_commands
+  description: |
+    Inspect a single NoETL execution for stale noetl.command rows.
+    Returns the row set and the most recent events that would block
+    or unblock the in-process reaper from republishing them.
+
+      noetl run playbooks/inspect_stale_commands.yaml --runtime local \
+        --set action=inspect \
+        --set execution_id=626611573817082718 \
+        --set pg_dsn=postgresql://noetl@localhost:5432/noetl
+
+    Lifecycle verbs: inspect (default), help.
+
+  exposes_as_mcp: true
+  tags:
+    - doctor
+    - runtime-reaper
+    - read-only
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  action: inspect              # inspect, help
+  pg_dsn: "postgresql://noetl@localhost:5432/noetl"
+  execution_id: 0
+
+workflow:
+  - step: start
+    desc: Entry point for per-execution stale-command inspection
+    tool:
+      kind: shell
+      cmds:
+        - echo "doctor.inspect_stale_commands - action '{{ workload.action }}' execution_id={{ workload.execution_id }}"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: command_rows
+          when: "{{ workload.action == 'inspect' }}"
+        - step: show_help
+
+  - step: command_rows
+    desc: Pull all non-terminal noetl.command rows for the execution
+    tool:
+      - name: rows
+        kind: postgres
+        dsn: "{{ workload.pg_dsn }}"
+        query: |
+          SELECT
+              c.command_id::text AS command_id,
+              c.event_id,
+              c.step_name AS step,
+              c.status,
+              c.worker_id,
+              c.attempt,
+              c.created_at,
+              c.claimed_at,
+              c.started_at,
+              c.completed_at,
+              r.status   AS worker_status,
+              r.heartbeat AS worker_heartbeat
+          FROM noetl.command c
+          LEFT JOIN noetl.runtime r
+              ON r.kind = 'worker_pool' AND r.name = c.worker_id
+          WHERE c.execution_id = {{ workload.execution_id }}
+            AND c.status IN ('PENDING', 'CLAIMED', 'RUNNING')
+          ORDER BY c.created_at
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: terminal_events
+
+  - step: terminal_events
+    desc: Detect whether the execution is already past terminal lifecycle
+    tool:
+      - name: terminal
+        kind: postgres
+        dsn: "{{ workload.pg_dsn }}"
+        query: |
+          SELECT event_type, created_at
+          FROM noetl.event
+          WHERE execution_id = {{ workload.execution_id }}
+            AND event_type IN (
+                'playbook.completed', 'playbook.failed',
+                'workflow.completed', 'workflow.failed',
+                'execution.cancelled'
+            )
+          ORDER BY created_at DESC
+          LIMIT 5
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: report
+
+  - step: report
+    desc: Combine into a single inspection result
+    tool:
+      - name: combine
+        kind: python
+        input:
+          rows: "{{ command_rows }}"
+          terminal: "{{ terminal_events }}"
+          execution_id: "{{ workload.execution_id }}"
+        code: |
+          rows = input_data.get("rows") or []
+          terminal = input_data.get("terminal") or []
+          return {
+              "status": "stuck" if (rows and not terminal) else "ok",
+              "execution_id": input_data.get("execution_id"),
+              "execution_terminal": bool(terminal),
+              "terminal_events": terminal,
+              "non_terminal_commands": rows,
+              "non_terminal_command_count": len(rows),
+          }
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: show_help
+    desc: Print usage for callers who invoked without a known action
+    tool:
+      kind: shell
+      cmds:
+        - |
+          echo "Usage:"
+          echo "  noetl run playbooks/inspect_stale_commands.yaml --runtime local --set action=<action>"
+          echo ""
+          echo "Actions: inspect, help"
+          echo ""
+          echo "Defaults:"
+          echo "  pg_dsn={{ workload.pg_dsn }}"
+          echo "  execution_id={{ workload.execution_id }}  (required for inspect)"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Terminal step
+    tool:
+      kind: noop
