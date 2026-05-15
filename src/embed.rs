@@ -84,4 +84,66 @@ mod tests {
         let written = std::fs::read_to_string(tmp.path()).unwrap();
         assert_eq!(written, DETECT_STUCK_EXECUTIONS);
     }
+
+    /// Regression test for the parse failure Codex hit on 2026-05-14:
+    ///
+    ///     workflow[1].tool[0]: invalid type: map, expected variant identifier
+    ///     at line 58 column 9
+    ///
+    /// Root cause: the noetl Rust CLI's local-runtime parser
+    /// (`repos/cli/src/playbook_runner.rs`) defines `Step.tool` as
+    /// `Option<Tool>` (a single internally-tagged enum), AND the
+    /// `Tool` variants are limited to:
+    /// `shell / http / playbook / duckdb / auth / sink / rhai`.
+    /// `postgres` and `python` are server-only tools.
+    ///
+    /// Every bundled doctor playbook MUST therefore:
+    ///   1. use a YAML mapping under `tool:` (not a sequence), AND
+    ///   2. set `kind:` to one of the local-runtime variants.
+    ///
+    /// This test walks each embedded playbook and asserts both.
+    #[test]
+    fn embedded_playbooks_parse_under_local_runtime_schema() {
+        const LOCAL_RUNTIME_TOOL_KINDS: &[&str] =
+            &["shell", "http", "playbook", "duckdb", "auth", "sink", "rhai"];
+
+        let cases = [
+            ("detect_stuck_executions", DETECT_STUCK_EXECUTIONS),
+            ("inspect_stale_commands", INSPECT_STALE_COMMANDS),
+            ("reachability_smoke", REACHABILITY_SMOKE),
+            ("trigger_command_reaper", TRIGGER_COMMAND_REAPER),
+            ("provision_doctor_mcp", PROVISION_DOCTOR_MCP),
+        ];
+
+        for (name, body) in cases {
+            let yaml: serde_yaml::Value =
+                serde_yaml::from_str(body).unwrap_or_else(|e| panic!("{name}: yaml parse failed: {e}"));
+            let workflow = yaml
+                .get("workflow")
+                .and_then(serde_yaml::Value::as_sequence)
+                .unwrap_or_else(|| panic!("{name}: missing or non-sequence workflow"));
+
+            for (i, step) in workflow.iter().enumerate() {
+                let step_name =
+                    step.get("step").and_then(serde_yaml::Value::as_str).unwrap_or("<unnamed>");
+                let Some(tool) = step.get("tool") else {
+                    continue;
+                };
+                assert!(
+                    tool.is_mapping(),
+                    "{name}: workflow[{i}] ({step_name}).tool must be a mapping for the \
+                     `noetl run --runtime local` parser. Found: {tool:?}"
+                );
+                let kind = tool
+                    .get("kind")
+                    .and_then(serde_yaml::Value::as_str)
+                    .unwrap_or_else(|| panic!("{name}: workflow[{i}] ({step_name}).tool.kind missing"));
+                assert!(
+                    LOCAL_RUNTIME_TOOL_KINDS.contains(&kind),
+                    "{name}: workflow[{i}] ({step_name}).tool.kind = '{kind}' is not \
+                     supported by the Rust local-runtime parser. Allowed: {LOCAL_RUNTIME_TOOL_KINDS:?}"
+                );
+            }
+        }
+    }
 }

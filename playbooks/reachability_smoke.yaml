@@ -16,6 +16,10 @@ metadata:
 
     Lifecycle verbs: probe (default), help.
 
+    Everything is `kind: shell` so the playbook parses under the
+    canonical `noetl run --runtime local` path, matching the rest of
+    `repos/ops`. The doctor Dockerfile bundles `curl`, `psql`, and `jq`.
+
   exposes_as_mcp: true
   tags:
     - doctor
@@ -39,83 +43,79 @@ workflow:
     tool:
       kind: shell
       cmds:
-        - echo "doctor.reachability_smoke - action '{{ workload.action }}'"
+        - |
+          set -euo pipefail
+          echo "doctor.reachability_smoke - action '{{ workload.action }}'" >&2
     next:
       spec:
         mode: exclusive
       arcs:
-        - step: probe_server_health
+        - step: probe
           when: "{{ workload.action == 'probe' }}"
         - step: show_help
 
-  - step: probe_server_health
-    desc: Hit /api/health on the NoETL server
+  - step: probe
+    desc: Combined server-health + pg-ping + worker-pool snapshot
     tool:
-      - name: health
-        kind: http
-        method: GET
-        url: "{{ workload.noetl_server_url }}/api/health"
-        timeout_seconds: 10
-    next:
-      spec:
-        mode: exclusive
-      arcs:
-        - step: probe_pg
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          NOETL_URL='{{ workload.noetl_server_url }}'
+          PG_DSN='{{ workload.pg_dsn }}'
 
-  - step: probe_pg
-    desc: Issue SELECT 1 against the NoETL Postgres database
-    tool:
-      - name: pg_ping
-        kind: postgres
-        dsn: "{{ workload.pg_dsn }}"
-        query: |
-          SELECT 1 AS ok
-    next:
-      spec:
-        mode: exclusive
-      arcs:
-        - step: probe_runtime_pool
+          # --- NoETL /api/health -------------------------------------
+          # -m 10 caps the request at 10s; -o /dev/null silences body;
+          # -w prints the HTTP status code we want for the JSON output.
+          SERVER_STATUS=$(curl -sS -m 10 -o /dev/null \
+                                -w '%{http_code}' \
+                                "${NOETL_URL}/api/health" || echo "000")
+          if [ "${SERVER_STATUS}" = "200" ]; then
+            SERVER_OK=true
+          else
+            SERVER_OK=false
+          fi
 
-  - step: probe_runtime_pool
-    desc: Count ready worker pool runtimes and stale rows
-    tool:
-      - name: pool
-        kind: postgres
-        dsn: "{{ workload.pg_dsn }}"
-        query: |
-          SELECT
-              COUNT(*) FILTER (WHERE status = 'ready')   AS ready_workers,
-              COUNT(*) FILTER (WHERE status != 'ready')  AS non_ready_workers,
-              COUNT(*) FILTER (
-                  WHERE heartbeat < (NOW() - INTERVAL '5 minutes')
-              )                                          AS stale_heartbeat_workers
-          FROM noetl.runtime
-          WHERE kind = 'worker_pool'
-    next:
-      spec:
-        mode: exclusive
-      arcs:
-        - step: report
+          # --- Postgres SELECT 1 -------------------------------------
+          if psql "${PG_DSN}" -A -t -X -c "SELECT 1" >/dev/null 2>&1; then
+            PG_OK=true
+          else
+            PG_OK=false
+          fi
 
-  - step: report
-    desc: Combine results
-    tool:
-      - name: combine
-        kind: python
-        input:
-          server_health: "{{ probe_server_health }}"
-          pg_ping: "{{ probe_pg }}"
-          pool: "{{ probe_runtime_pool }}"
-        code: |
-          server = input_data.get("server_health") or {}
-          pool_rows = input_data.get("pool") or []
-          pool = pool_rows[0] if pool_rows else {}
-          ok = bool(server) and bool(input_data.get("pg_ping"))
-          return {
-              "ok": ok,
-              "noetl_server_health": server,
-              "worker_pool": pool,
-          }
+          # --- Worker pool snapshot ----------------------------------
+          # Returns a single JSON object; if psql fails we still want
+          # the rest of the report, so trap to a safe default.
+          POOL=$(psql "${PG_DSN}" -A -t -X -c "
+            SELECT json_build_object(
+              'ready_workers',
+                COUNT(*) FILTER (WHERE status = 'ready'),
+              'non_ready_workers',
+                COUNT(*) FILTER (WHERE status != 'ready'),
+              'stale_heartbeat_workers',
+                COUNT(*) FILTER (
+                    WHERE heartbeat < (NOW() - INTERVAL '5 minutes')
+                )
+            )::text
+            FROM noetl.runtime
+            WHERE kind = 'worker_pool'" 2>/dev/null || echo '{}')
+
+          if [ -z "${POOL}" ]; then
+            POOL='{}'
+          fi
+
+          # --- Final Outcome JSON ------------------------------------
+          jq -n \
+            --arg server_status "${SERVER_STATUS}" \
+            --argjson server_ok ${SERVER_OK} \
+            --argjson pg_ok ${PG_OK} \
+            --argjson pool "${POOL}" \
+            '{
+              ok: ($server_ok and $pg_ok),
+              noetl_server_health: {status_code: ($server_status|tonumber? // 0), ok: $server_ok},
+              postgres: {ok: $pg_ok},
+              worker_pool: $pool
+            }'
     next:
       spec:
         mode: exclusive
@@ -145,4 +145,6 @@ workflow:
   - step: end
     desc: Terminal step
     tool:
-      kind: noop
+      kind: shell
+      cmds:
+        - ":"

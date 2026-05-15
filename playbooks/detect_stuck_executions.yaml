@@ -8,7 +8,9 @@ metadata:
     Mirrors the in-process command reaper's staleness predicate so
     monitoring sees the same surface the server would act on.
 
-    Designed to run under `noetl run --runtime local`:
+    Designed to run under `noetl run --runtime local` (the canonical
+    repos/ops invocation pattern), so every step uses `kind: shell`
+    with `psql` + `jq`. The doctor Dockerfile bundles both.
 
       noetl run playbooks/detect_stuck_executions.yaml --runtime local \
         --set action=detect \
@@ -43,134 +45,138 @@ workflow:
     tool:
       kind: shell
       cmds:
-        - echo "doctor.detect_stuck_executions - action '{{ workload.action }}'"
+        - |
+          set -euo pipefail
+          ACTION="{{ workload.action }}"
+          echo "doctor.detect_stuck_executions - action '${ACTION}'" >&2
     next:
       spec:
         mode: exclusive
       arcs:
-        - step: probe_stuck_executions
+        - step: scan
           when: "{{ workload.action == 'detect' }}"
         - step: show_help
 
-  - step: probe_stuck_executions
-    desc: Find executions with no terminal event and no recent activity
+  - step: scan
+    desc: Single psql pass returning a JSON object with stuck execs + stale commands
     tool:
-      - name: stuck_executions
-        kind: postgres
-        dsn: "{{ workload.pg_dsn }}"
-        query: |
-          WITH live_execs AS (
-              SELECT DISTINCT e.execution_id
-              FROM noetl.event e
-              WHERE e.event_type IN ('execution.started', 'execution.resumed')
-                AND NOT EXISTS (
-                    SELECT 1 FROM noetl.event et
-                    WHERE et.execution_id = e.execution_id
-                      AND et.event_type IN (
-                          'playbook.completed', 'playbook.failed',
-                          'workflow.completed', 'workflow.failed',
-                          'execution.cancelled'
-                      )
-                )
-          ),
-          last_event AS (
-              SELECT e.execution_id, MAX(e.created_at) AS last_at
-              FROM noetl.event e
-              JOIN live_execs le ON le.execution_id = e.execution_id
-              GROUP BY e.execution_id
-          )
-          SELECT
-              le.execution_id,
-              le.last_at AS last_event_at,
-              EXTRACT(EPOCH FROM (NOW() - le.last_at)) AS stuck_seconds,
-              (
-                  SELECT count(*) FROM noetl.command c
-                  WHERE c.execution_id = le.execution_id
-                    AND c.status IN ('PENDING', 'CLAIMED', 'RUNNING')
-              ) AS non_terminal_command_count
-          FROM last_event le
-          WHERE le.last_at < (NOW() - make_interval(secs => {{ workload.stale_seconds }}))
-          ORDER BY le.last_at ASC
-          LIMIT {{ workload.max_rows }}
-    next:
-      spec:
-        mode: exclusive
-      arcs:
-        - step: probe_stale_commands
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          PG_DSN='{{ workload.pg_dsn }}'
+          STALE_SECONDS='{{ workload.stale_seconds }}'
+          PENDING_RETRY_SECONDS='{{ workload.pending_retry_seconds }}'
+          MAX_ROWS='{{ workload.max_rows }}'
 
-  - step: probe_stale_commands
-    desc: Surface stale PENDING/CLAIMED/RUNNING noetl.command rows
-    tool:
-      - name: stale_commands
-        kind: postgres
-        dsn: "{{ workload.pg_dsn }}"
-        query: |
-          SELECT
-              c.event_id,
-              c.execution_id,
-              c.command_id::text AS command_id,
-              c.step_name        AS step,
-              c.status,
-              c.worker_id,
-              EXTRACT(EPOCH FROM (NOW() - c.claimed_at)) AS claim_age_seconds,
-              EXTRACT(EPOCH FROM (NOW() - c.created_at)) AS pending_age_seconds,
-              r.status AS worker_status,
-              EXTRACT(EPOCH FROM (NOW() - r.heartbeat)) AS worker_heartbeat_age_seconds
-          FROM noetl.command c
-          LEFT JOIN noetl.runtime r
-              ON r.kind = 'worker_pool' AND r.name = c.worker_id
-          WHERE c.status IN ('PENDING', 'CLAIMED', 'RUNNING')
-            AND (
-                  (c.status IN ('CLAIMED', 'RUNNING')
-                      AND c.claimed_at IS NOT NULL
-                      AND c.claimed_at < (NOW() - make_interval(secs => {{ workload.stale_seconds }})))
-               OR (c.status = 'PENDING'
-                      AND c.created_at < (NOW() - make_interval(secs => {{ workload.pending_retry_seconds }})))
-            )
-            AND NOT EXISTS (
-                SELECT 1 FROM noetl.event et
-                WHERE et.execution_id = c.execution_id
-                  AND et.event_type IN (
-                      'playbook.completed', 'playbook.failed',
-                      'workflow.completed', 'workflow.failed',
-                      'execution.cancelled'
+          # We collapse detection into one psql call so the playbook
+          # works in `noetl run --runtime local` (no kind: postgres
+          # variant in the Rust local-runtime parser). The query
+          # emits a single JSON object; the final echo wraps it with
+          # the doctor Outcome contract (status + thresholds + data).
+          QUERY=$(cat <<SQL
+            WITH live_execs AS (
+                SELECT DISTINCT e.execution_id
+                FROM noetl.event e
+                WHERE e.event_type IN ('execution.started', 'execution.resumed')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM noetl.event et
+                      WHERE et.execution_id = e.execution_id
+                        AND et.event_type IN (
+                            'playbook.completed', 'playbook.failed',
+                            'workflow.completed', 'workflow.failed',
+                            'execution.cancelled'
+                        )
                   )
+            ),
+            last_event AS (
+                SELECT e.execution_id, MAX(e.created_at) AS last_at
+                FROM noetl.event e
+                JOIN live_execs le ON le.execution_id = e.execution_id
+                GROUP BY e.execution_id
+            ),
+            stuck AS (
+                SELECT
+                    le.execution_id,
+                    le.last_at AS last_event_at,
+                    EXTRACT(EPOCH FROM (NOW() - le.last_at)) AS stuck_seconds,
+                    (
+                        SELECT count(*) FROM noetl.command c
+                        WHERE c.execution_id = le.execution_id
+                          AND c.status IN ('PENDING', 'CLAIMED', 'RUNNING')
+                    ) AS non_terminal_command_count
+                FROM last_event le
+                WHERE le.last_at < (NOW() - make_interval(secs => ${STALE_SECONDS}))
+                ORDER BY le.last_at ASC
+                LIMIT ${MAX_ROWS}
+            ),
+            stale_commands AS (
+                SELECT
+                    c.event_id,
+                    c.execution_id,
+                    c.command_id::text AS command_id,
+                    c.step_name        AS step,
+                    c.status,
+                    c.worker_id,
+                    EXTRACT(EPOCH FROM (NOW() - c.claimed_at)) AS claim_age_seconds,
+                    EXTRACT(EPOCH FROM (NOW() - c.created_at)) AS pending_age_seconds,
+                    r.status AS worker_status,
+                    EXTRACT(EPOCH FROM (NOW() - r.heartbeat)) AS worker_heartbeat_age_seconds
+                FROM noetl.command c
+                LEFT JOIN noetl.runtime r
+                    ON r.kind = 'worker_pool' AND r.name = c.worker_id
+                WHERE c.status IN ('PENDING', 'CLAIMED', 'RUNNING')
+                  AND (
+                        (c.status IN ('CLAIMED', 'RUNNING')
+                            AND c.claimed_at IS NOT NULL
+                            AND c.claimed_at < (NOW() - make_interval(secs => ${STALE_SECONDS})))
+                     OR (c.status = 'PENDING'
+                            AND c.created_at < (NOW() - make_interval(secs => ${PENDING_RETRY_SECONDS})))
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM noetl.event et
+                      WHERE et.execution_id = c.execution_id
+                        AND et.event_type IN (
+                            'playbook.completed', 'playbook.failed',
+                            'workflow.completed', 'workflow.failed',
+                            'execution.cancelled'
+                        )
+                  )
+                ORDER BY c.execution_id, c.claimed_at NULLS LAST, c.created_at
+                LIMIT ${MAX_ROWS}
             )
-          ORDER BY c.execution_id, c.claimed_at NULLS LAST, c.created_at
-          LIMIT {{ workload.max_rows }}
-    next:
-      spec:
-        mode: exclusive
-      arcs:
-        - step: report
+            SELECT json_build_object(
+              'stuck_executions',
+                COALESCE((SELECT json_agg(s.*) FROM stuck s), '[]'::json),
+              'stale_commands',
+                COALESCE((SELECT json_agg(c.*) FROM stale_commands c), '[]'::json)
+            )::text AS payload;
+          SQL
+          )
 
-  - step: report
-    desc: Summarize detection results for the caller
-    tool:
-      - name: summarize
-        kind: python
-        input:
-          stuck_executions: "{{ probe_stuck_executions }}"
-          stale_commands: "{{ probe_stale_commands }}"
-          stale_seconds: "{{ workload.stale_seconds }}"
-          pending_retry_seconds: "{{ workload.pending_retry_seconds }}"
-        code: |
-          stuck = input_data.get("stuck_executions") or []
-          stale = input_data.get("stale_commands") or []
-          status = "stuck" if (stuck or stale) else "ok"
-          return {
-              "status": status,
-              "thresholds": {
-                  "stale_seconds": input_data.get("stale_seconds"),
-                  "pending_retry_seconds": input_data.get("pending_retry_seconds"),
-              },
-              "stuck_executions": stuck,
-              "stale_commands": stale,
-              "summary": {
-                  "stuck_execution_count": len(stuck),
-                  "stale_command_count": len(stale),
-              },
-          }
+          # -A -t -X => unaligned, tuples-only, no .psqlrc. We get a
+          # single JSON object on stdout.
+          PAYLOAD=$(psql "${PG_DSN}" -A -t -X -c "${QUERY}")
+          if [ -z "${PAYLOAD}" ]; then
+            PAYLOAD='{"stuck_executions":[],"stale_commands":[]}'
+          fi
+
+          # Compose the Outcome envelope. The doctor Rust runner picks
+          # up the LAST balanced JSON object on stdout, so this echo is
+          # what the caller sees.
+          echo "${PAYLOAD}" | jq \
+            --argjson stale "${STALE_SECONDS}" \
+            --argjson pending "${PENDING_RETRY_SECONDS}" \
+            '{
+              status: (if ((.stuck_executions|length) + (.stale_commands|length)) > 0 then "stuck" else "ok" end),
+              thresholds: {stale_seconds: $stale, pending_retry_seconds: $pending},
+              stuck_executions: .stuck_executions,
+              stale_commands: .stale_commands,
+              summary: {
+                stuck_execution_count: (.stuck_executions|length),
+                stale_command_count: (.stale_commands|length)
+              }
+            }'
     next:
       spec:
         mode: exclusive
@@ -201,4 +207,6 @@ workflow:
   - step: end
     desc: Terminal step
     tool:
-      kind: noop
+      kind: shell
+      cmds:
+        - ":"

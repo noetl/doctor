@@ -5,8 +5,8 @@ metadata:
   path: doctor/inspect_stale_commands
   description: |
     Inspect a single NoETL execution for stale noetl.command rows.
-    Returns the row set and the most recent events that would block
-    or unblock the in-process reaper from republishing them.
+    Returns the row set and the most recent terminal events that would
+    block or unblock the in-process reaper from republishing them.
 
       noetl run playbooks/inspect_stale_commands.yaml --runtime local \
         --set action=inspect \
@@ -14,6 +14,9 @@ metadata:
         --set pg_dsn=postgresql://noetl@localhost:5432/noetl
 
     Lifecycle verbs: inspect (default), help.
+
+    Implemented with `kind: shell` + `psql` + `jq` so it parses under
+    the canonical `noetl run --runtime local` path.
 
   exposes_as_mcp: true
   tags:
@@ -36,90 +39,94 @@ workflow:
     tool:
       kind: shell
       cmds:
-        - echo "doctor.inspect_stale_commands - action '{{ workload.action }}' execution_id={{ workload.execution_id }}"
+        - |
+          set -euo pipefail
+          echo "doctor.inspect_stale_commands - action '{{ workload.action }}' execution_id={{ workload.execution_id }}" >&2
     next:
       spec:
         mode: exclusive
       arcs:
-        - step: command_rows
+        - step: inspect
           when: "{{ workload.action == 'inspect' }}"
         - step: show_help
 
-  - step: command_rows
-    desc: Pull all non-terminal noetl.command rows for the execution
+  - step: inspect
+    desc: Pull non-terminal commands + last 5 terminal events for the execution
     tool:
-      - name: rows
-        kind: postgres
-        dsn: "{{ workload.pg_dsn }}"
-        query: |
-          SELECT
-              c.command_id::text AS command_id,
-              c.event_id,
-              c.step_name AS step,
-              c.status,
-              c.worker_id,
-              c.attempt,
-              c.created_at,
-              c.claimed_at,
-              c.started_at,
-              c.completed_at,
-              r.status   AS worker_status,
-              r.heartbeat AS worker_heartbeat
-          FROM noetl.command c
-          LEFT JOIN noetl.runtime r
-              ON r.kind = 'worker_pool' AND r.name = c.worker_id
-          WHERE c.execution_id = {{ workload.execution_id }}
-            AND c.status IN ('PENDING', 'CLAIMED', 'RUNNING')
-          ORDER BY c.created_at
-    next:
-      spec:
-        mode: exclusive
-      arcs:
-        - step: terminal_events
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          PG_DSN='{{ workload.pg_dsn }}'
+          EXECUTION_ID='{{ workload.execution_id }}'
 
-  - step: terminal_events
-    desc: Detect whether the execution is already past terminal lifecycle
-    tool:
-      - name: terminal
-        kind: postgres
-        dsn: "{{ workload.pg_dsn }}"
-        query: |
-          SELECT event_type, created_at
-          FROM noetl.event
-          WHERE execution_id = {{ workload.execution_id }}
-            AND event_type IN (
-                'playbook.completed', 'playbook.failed',
-                'workflow.completed', 'workflow.failed',
-                'execution.cancelled'
+          if [ "${EXECUTION_ID}" = "0" ] || [ -z "${EXECUTION_ID}" ]; then
+            jq -n '{status: "error", error: "execution_id is required for action=inspect"}'
+            exit 0
+          fi
+
+          QUERY=$(cat <<SQL
+            WITH cmds AS (
+                SELECT
+                    c.command_id::text AS command_id,
+                    c.event_id,
+                    c.step_name AS step,
+                    c.status,
+                    c.worker_id,
+                    c.attempt,
+                    c.created_at,
+                    c.claimed_at,
+                    c.started_at,
+                    c.completed_at,
+                    r.status    AS worker_status,
+                    r.heartbeat AS worker_heartbeat
+                FROM noetl.command c
+                LEFT JOIN noetl.runtime r
+                    ON r.kind = 'worker_pool' AND r.name = c.worker_id
+                WHERE c.execution_id = ${EXECUTION_ID}
+                  AND c.status IN ('PENDING', 'CLAIMED', 'RUNNING')
+                ORDER BY c.created_at
+            ),
+            term AS (
+                SELECT event_type, created_at
+                FROM noetl.event
+                WHERE execution_id = ${EXECUTION_ID}
+                  AND event_type IN (
+                      'playbook.completed', 'playbook.failed',
+                      'workflow.completed', 'workflow.failed',
+                      'execution.cancelled'
+                  )
+                ORDER BY created_at DESC
+                LIMIT 5
             )
-          ORDER BY created_at DESC
-          LIMIT 5
-    next:
-      spec:
-        mode: exclusive
-      arcs:
-        - step: report
+            SELECT json_build_object(
+              'non_terminal_commands',
+                COALESCE((SELECT json_agg(cmds.*) FROM cmds), '[]'::json),
+              'terminal_events',
+                COALESCE((SELECT json_agg(term.*) FROM term), '[]'::json)
+            )::text;
+          SQL
+          )
 
-  - step: report
-    desc: Combine into a single inspection result
-    tool:
-      - name: combine
-        kind: python
-        input:
-          rows: "{{ command_rows }}"
-          terminal: "{{ terminal_events }}"
-          execution_id: "{{ workload.execution_id }}"
-        code: |
-          rows = input_data.get("rows") or []
-          terminal = input_data.get("terminal") or []
-          return {
-              "status": "stuck" if (rows and not terminal) else "ok",
-              "execution_id": input_data.get("execution_id"),
-              "execution_terminal": bool(terminal),
-              "terminal_events": terminal,
-              "non_terminal_commands": rows,
-              "non_terminal_command_count": len(rows),
-          }
+          PAYLOAD=$(psql "${PG_DSN}" -A -t -X -c "${QUERY}")
+          if [ -z "${PAYLOAD}" ]; then
+            PAYLOAD='{"non_terminal_commands":[],"terminal_events":[]}'
+          fi
+
+          echo "${PAYLOAD}" | jq \
+            --arg execution_id "${EXECUTION_ID}" \
+            '{
+              status: (
+                if ((.non_terminal_commands|length) > 0
+                    and (.terminal_events|length) == 0)
+                then "stuck" else "ok" end
+              ),
+              execution_id: ($execution_id|tonumber? // $execution_id),
+              execution_terminal: ((.terminal_events|length) > 0),
+              terminal_events: .terminal_events,
+              non_terminal_commands: .non_terminal_commands,
+              non_terminal_command_count: (.non_terminal_commands|length)
+            }'
     next:
       spec:
         mode: exclusive
@@ -149,4 +156,6 @@ workflow:
   - step: end
     desc: Terminal step
     tool:
-      kind: noop
+      kind: shell
+      cmds:
+        - ":"
