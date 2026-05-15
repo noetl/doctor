@@ -11,7 +11,7 @@
 # overriding `CMD`.
 #
 # Build args:
-#   NOETL_CLI_VERSION   (default 2.14.1) — release tag of `noetl/cli`
+#   NOETL_CLI_VERSION   (default 2.14.2) — release tag of `noetl/cli`
 #   TARGETARCH          (provided by Docker/Podman buildx: amd64 / arm64)
 
 # ---- chef stage (cargo-chef dependency cache) -------------------------------
@@ -31,7 +31,7 @@ RUN cargo build --release --bin noetl-doctor
 
 # ---- noetl CLI fetch (uses release asset) -----------------------------------
 FROM ubuntu:24.04 AS noetl-cli
-ARG NOETL_CLI_VERSION=2.14.1
+ARG NOETL_CLI_VERSION=2.14.2
 ARG TARGETARCH
 WORKDIR /tmp
 RUN apt-get update \
