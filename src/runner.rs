@@ -9,7 +9,8 @@
 //! * parsing the final structured value emitted by the playbook's terminal
 //!   step. The playbooks under `playbooks/*.yaml` write a JSON object as the
 //!   tool result on the report step; we look for the last JSON object in
-//!   stdout (the `noetl` CLI prints structured output on success).
+//!   stdout first, then stderr. Some `noetl run --runtime local` versions send
+//!   step/tool output to stderr while reserving stdout for machine output.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -62,8 +63,8 @@ impl PlaybookRunner {
     ///
     /// The healing playbooks all end with a `report` step whose tool emits
     /// a JSON object via Python `return {...}`; the NoETL CLI prints that
-    /// object on stdout. We tolerate non-JSON noise around it by scanning
-    /// for the last balanced JSON object in the output.
+    /// object to the CLI output. We tolerate non-JSON noise around it by
+    /// scanning for the last balanced JSON object in stdout, then stderr.
     pub async fn run(&self, opts: PlaybookRunOptions) -> Result<Value> {
         let mut cmd = Command::new(&self.noetl_bin);
         cmd.arg("run").arg(&opts.playbook).arg("--runtime").arg(opts.runtime);
@@ -101,22 +102,25 @@ impl PlaybookRunner {
             ));
         }
 
-        Ok(extract_last_json_object(&stdout).unwrap_or_else(|| {
+        Ok(extract_last_json_payload(&stdout, &stderr).unwrap_or_else(|| {
             // Healing playbooks should always emit a JSON object on the
             // terminal report step; if for any reason they don't, surface
-            // the raw stdout so the caller can debug rather than swallow it.
+            // the raw streams so the caller can debug rather than swallow it.
             serde_json::json!({
                 "raw_stdout": tail(&stdout, 4000),
-                "raw_stderr": tail(&stderr, 1000),
-                "note": "noetl run succeeded but no JSON object was found on stdout"
+                "raw_stderr": tail(&stderr, 4000),
+                "note": "noetl run succeeded but no JSON object was found on stdout or stderr"
             })
         }))
     }
 }
 
+fn extract_last_json_payload(stdout: &str, stderr: &str) -> Option<Value> {
+    extract_last_json_object(stdout).or_else(|| extract_last_json_object(stderr))
+}
+
 /// Heuristic: find the last balanced JSON object/array in `s`. The healing
-/// playbooks finish with `return {...}` from a Python step; the NoETL CLI
-/// prints that structure as the last thing on stdout.
+/// playbooks finish with a report step that prints a JSON object.
 fn extract_last_json_object(s: &str) -> Option<Value> {
     let bytes = s.as_bytes();
     // Walk backwards looking for a closing brace, then locate the matching open.
@@ -193,5 +197,20 @@ mod tests {
         let v = extract_last_json_object(stdout).unwrap();
         assert_eq!(v["a"]["b"], 1);
         assert_eq!(v["a"]["c"][2], 3);
+    }
+
+    #[test]
+    fn payload_prefers_stdout_when_present() {
+        let v = extract_last_json_payload("{\"stream\":\"stdout\"}", "{\"stream\":\"stderr\"}")
+            .expect("json should be found");
+        assert_eq!(v["stream"], "stdout");
+    }
+
+    #[test]
+    fn payload_falls_back_to_stderr() {
+        let stderr = "📋 Running playbook\n{\"status\":\"ok\",\"count\":0}\n";
+        let v = extract_last_json_payload("", stderr).expect("json should be found");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["count"], 0);
     }
 }
