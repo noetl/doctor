@@ -5,8 +5,9 @@ metadata:
   path: doctor/detect_stuck_executions
   description: |
     Detect stuck NoETL executions and stale noetl.command rows. Read-only.
-    Mirrors the in-process command reaper's staleness predicate so
-    monitoring sees the same surface the server would act on.
+    Mirrors the server-side command reaper's observable staleness
+    surface so monitoring sees the same class of rows the server may
+    republish. The NoETL server remains the authority for recovery.
 
     Designed to run under `noetl run --runtime local` (the canonical
     repos/ops invocation pattern), so every step uses `kind: shell`

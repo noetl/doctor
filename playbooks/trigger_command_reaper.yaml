@@ -5,7 +5,7 @@ metadata:
   path: doctor/trigger_command_reaper
   description: |
     Ask a running NoETL server to run a single command-reaper sweep
-    on demand. The endpoint is idempotent: the in-process reaper is
+    on demand. The endpoint is idempotent: the server-side reaper is
     still the authority and runs on its own interval; this call is a
     best-effort nudge driven from monitoring/MCP.
 
