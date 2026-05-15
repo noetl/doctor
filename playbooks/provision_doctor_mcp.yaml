@@ -104,19 +104,6 @@ workflow:
           }
 
           apply_manifests() {
-            local pg_dsn_env_block=""
-            if [ -n "$PG_DSN" ]; then
-              pg_dsn_env_block="$(cat <<'EOF'
-                - name: NOETL_DOCTOR_PG_DSN
-                  valueFrom:
-                    secretKeyRef:
-                      name: RELEASE_NAME_PLACEHOLDER-config
-                      key: pg_dsn
-          EOF
-              )"
-              pg_dsn_env_block="${pg_dsn_env_block//RELEASE_NAME_PLACEHOLDER/$RELEASE_NAME}"
-            fi
-
             cat <<EOF | kubectl apply -f -
           apiVersion: v1
           kind: ServiceAccount
@@ -157,7 +144,6 @@ workflow:
                         value: "${STALE_SECONDS}"
                       - name: NOETL_DOCTOR_PENDING_RETRY_SECONDS
                         value: "${PENDING_RETRY_SECONDS}"
-          ${pg_dsn_env_block}
                     ports:
                       - name: http
                         containerPort: ${SERVICE_PORT}
@@ -199,6 +185,34 @@ workflow:
                 port: ${SERVICE_PORT}
                 targetPort: http
           EOF
+
+            configure_pg_dsn_env
+          }
+
+          configure_pg_dsn_env() {
+            # Keep the generated manifest static and patch the optional
+            # secret-backed value separately to avoid YAML indentation drift
+            # inside the playbook shell block.
+            if [ -n "$PG_DSN" ]; then
+              kubectl -n "$NAMESPACE" set env "deployment/$RELEASE_NAME" NOETL_DOCTOR_PG_DSN- >/dev/null 2>&1 || true
+              kubectl -n "$NAMESPACE" patch deployment "$RELEASE_NAME" --type=json -p="[
+                {
+                  \"op\": \"add\",
+                  \"path\": \"/spec/template/spec/containers/0/env/-\",
+                  \"value\": {
+                    \"name\": \"NOETL_DOCTOR_PG_DSN\",
+                    \"valueFrom\": {
+                      \"secretKeyRef\": {
+                        \"name\": \"${RELEASE_NAME}-config\",
+                        \"key\": \"pg_dsn\"
+                      }
+                    }
+                  }
+                }
+              ]"
+            else
+              kubectl -n "$NAMESPACE" set env "deployment/$RELEASE_NAME" NOETL_DOCTOR_PG_DSN- >/dev/null 2>&1 || true
+            fi
           }
 
           deploy() {
