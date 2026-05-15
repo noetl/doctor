@@ -2,7 +2,7 @@
 #
 # Builds the Rust `noetl-doctor` binary, then bundles the upstream
 # `noetl` Rust CLI release for `noetl run --runtime local`. The final
-# image is a small Debian runtime suitable for either:
+# image is an Ubuntu runtime suitable for either:
 #
 #   * a one-shot Kubernetes Job  → CMD: ["detect"]
 #   * a long-running MCP server  → CMD: ["mcp", "serve"]
@@ -30,7 +30,7 @@ COPY . .
 RUN cargo build --release --bin noetl-doctor
 
 # ---- noetl CLI fetch (uses release asset) -----------------------------------
-FROM debian:bookworm-slim AS noetl-cli
+FROM ubuntu:24.04 AS noetl-cli
 ARG NOETL_CLI_VERSION=2.14.1
 ARG TARGETARCH
 WORKDIR /tmp
@@ -49,7 +49,7 @@ RUN apt-get update \
  && /usr/local/bin/noetl --version
 
 # ---- runtime ---------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM ubuntu:24.04 AS runtime
 WORKDIR /app
 # Healing playbooks run under `noetl run --runtime local`, which only
 # supports `kind: shell` / http / playbook / duckdb / auth / sink / rhai
