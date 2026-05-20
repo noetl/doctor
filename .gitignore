@@ -456,3 +456,7 @@ htmlcov/
 # Cargo.lock is committed (this is a binary crate).
 /target/
 **/*.rs.bk
+
+
+# THIS IS FOR SEMANTIC RELEASE. DO NOT REMOVE! 
+!.releaserc.json

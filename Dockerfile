@@ -50,6 +50,10 @@ RUN apt-get update \
 
 # ---- runtime ---------------------------------------------------------------
 FROM ubuntu:24.04 AS runtime
+
+LABEL org.opencontainers.image.source=https://github.com/noetl/doctor
+LABEL org.opencontainers.image.licenses=MIT
+
 WORKDIR /app
 # Healing playbooks run under `noetl run --runtime local`, which only
 # supports `kind: shell` / http / playbook / duckdb / auth / sink / rhai
