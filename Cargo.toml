@@ -1,6 +1,6 @@
 [package]
 name = "noetl-doctor"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "Out-of-process runtime reaper for NoETL. Thin Rust wrapper over the `noetl` CLI that runs healing playbooks in local-runtime mode and exposes an MCP HTTP surface for monitoring-driven repair."
