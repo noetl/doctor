@@ -50,7 +50,7 @@ RUN apt-get update \
 
 # ---- runtime ---------------------------------------------------------------
 FROM ubuntu:24.04 AS runtime
-# ===
+
 LABEL org.opencontainers.image.source=https://github.com/noetl/doctor
 LABEL org.opencontainers.image.licenses=MIT
 
