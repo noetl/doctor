@@ -1,0 +1,63 @@
+# PR gate for noetl/doctor.
+#
+# WHY THIS EXISTS: before this file, this repo's only workflows were
+# `release.yml` and `build_on_release.yml`, both triggered by a release/tag. So
+# nothing ran on a pull request and nothing ran on a merge to main — a red test
+# could land and stay. Found during a cross-repo CI audit (noetl/ai-meta#375);
+# `noetl/ehdb`'s ci.yml is the shape this follows.
+#
+# WHAT IS GATED, AND WHY NOT MORE: each check below was measured against
+# origin/main BEFORE being added, because a gate that is red on the day it lands
+# is a gate people learn to skip:
+#
+#   cargo test --all-targets --locked          exit 0            -> GATED
+#   cargo clippy --all-targets -- -D warnings  exit 0, 0 warns   -> GATED
+#   cargo fmt --all --check                    exit 1, 396 lines -> NOT gated
+#
+# The fmt backlog is real and is reported, not enforced. Do NOT "fix" it by
+# running `cargo fmt --all`: rustfmt 1.9.0 on these crates reformats far beyond
+# the intended file (an earlier attempt rewrote 39 files and broke a test).
+# Format single paths with `rustfmt <path>` instead.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # --all-targets, not the default: plain `cargo test` skips targets that
+      # --all-targets compiles, which is how a test that does not compile can sit
+      # on main looking fine.
+      - name: cargo test
+        run: cargo test --all-targets --locked
+
+      # -D warnings, NOT `|| true`. Five sibling repos run clippy with `|| true`,
+      # which means their lint step cannot fail (noetl/ai-meta#374) — it pays the
+      # full runtime for none of the benefit. Measured clean here, so it gates.
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo fmt (report only — 396-line backlog, see header)
+        if: always()
+        run: |
+          set -uo pipefail
+          cargo fmt --all --check > /tmp/fmt.diff 2>&1 && {
+            echo "formatting clean — this step can be promoted to a gate"; exit 0; }
+          echo "fmt backlog: $(wc -l < /tmp/fmt.diff) diff lines   <- the denominator"
+          head -40 /tmp/fmt.diff
