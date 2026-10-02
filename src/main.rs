@@ -361,3 +361,8 @@ mod commands {
     }
 }
 
+
+// scratch RED control — clippy::ptr_arg + clippy::len_zero. Reverted immediately.
+pub fn ci_red_control_lint(v: &Vec<i32>) -> bool {
+    v.len() == 0
+}
